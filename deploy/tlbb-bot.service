@@ -1,0 +1,29 @@
+[Unit]
+Description=TLBB Telegram Bot
+Wants=network-online.target
+After=network-online.target tlbb-ocr.service
+Requires=tlbb-ocr.service
+
+[Service]
+Type=simple
+User=tlbbbot
+Group=tlbbbot
+WorkingDirectory=/opt/tlbb-bot/current
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONPATH=/opt/tlbb-bot/current/src
+ExecStart=/opt/tlbb-bot/venv/bin/python -B -m tlbb_bot.telegram_bot --env /opt/tlbb-bot/shared/.env
+Restart=always
+RestartSec=10
+TimeoutStopSec=45
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/opt/tlbb-bot/shared
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

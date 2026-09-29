@@ -1,0 +1,14 @@
+.env
+*.env
+!example*.env
+
+ban_admin_session.json
+__pycache__/
+*.py[cod]
+
+telegram-bot.*.log
+.telegram-admins.json
+.*telegram-admins.json.*.tmp
+
+# Local Codex maintenance artifacts
+codex-upgrade-after-exit.*

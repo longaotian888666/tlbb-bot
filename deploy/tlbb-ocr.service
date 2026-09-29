@@ -1,0 +1,29 @@
+[Unit]
+Description=TLBB Local OCR Service
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=tlbbbot
+Group=tlbbbot
+WorkingDirectory=/opt/tlbb-ocr/current
+Environment=HOME=/var/lib/tlbb-ocr
+Environment=DDDDOCR_MODELS_DIR=/opt/tlbb-ocr/current/models
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/tlbb-ocr/venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1
+Restart=always
+RestartSec=10
+TimeoutStopSec=30
+UMask=0077
+StateDirectory=tlbb-ocr
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target
