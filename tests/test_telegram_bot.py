@@ -34,6 +34,7 @@ from tlbb_bot.telegram_bot import (  # noqa: E402
     BTN_ROLE,
     NETWORK_RESTART_REQUESTED_KEY,
     PASSWORD_ACCOUNT_KEY,
+    STATE_AGENT_ACCOUNT,
     STATE_CONFIRM,
     STATE_KEY,
     STATE_MAIN,
@@ -144,12 +145,15 @@ def make_update(
     *,
     user_id: int = 123,
     chat_type: str = ChatType.PRIVATE,
+    chat_id: int | None = None,
 ) -> tuple[Any, FakeMessage]:
     message = FakeMessage(text)
+    if chat_id is None:
+        chat_id = user_id if chat_type == ChatType.PRIVATE else -1001234567890
     update = SimpleNamespace(
         effective_message=message,
         effective_user=SimpleNamespace(id=user_id),
-        effective_chat=SimpleNamespace(type=chat_type),
+        effective_chat=SimpleNamespace(id=chat_id, type=chat_type),
     )
     return update, message
 
@@ -268,6 +272,7 @@ class TelegramControllerTests(unittest.IsolatedAsyncioTestCase):
             keyboard_texts(markup),
             [[BTN_AGENT, BTN_PASSWORD], [BTN_ROLE], [BTN_ADMIN]],
         )
+        self.assertTrue(cast(Any, markup).selective)
 
     async def test_regular_admin_does_not_see_or_open_admin_management(self) -> None:
         registry = TelegramAdminRegistry(
@@ -379,7 +384,7 @@ class TelegramControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("总管理员：", forged_list_message.sent[-1][0])
         self.assertFalse(registry.is_authorized(789))
 
-    async def test_unauthorized_or_group_chat_cannot_reach_backend(self) -> None:
+    async def test_unauthorized_user_is_blocked_and_authorized_group_can_start(self) -> None:
         controller, processor = self.make_controller(allowed_user_ids=frozenset())
         context = make_context()
         unauthorized, unauthorized_message = make_update("/start")
@@ -391,9 +396,109 @@ class TelegramControllerTests(unittest.IsolatedAsyncioTestCase):
         await group_controller.start(group_update, make_context())
 
         self.assertIn("未授权", unauthorized_message.sent[-1][0])
-        self.assertIn("请私聊", group_message.sent[-1][0])
+        self.assertIn("请选择功能", group_message.sent[-1][0])
+        self.assertTrue(group_message.sent[-1][1]["do_quote"])
+        group_markup = group_message.sent[-1][1]["reply_markup"]
+        self.assertEqual(keyboard_texts(group_markup), [[BTN_AGENT], [BTN_ROLE]])
         self.assertEqual(processor.calls, [])
         self.assertEqual(group_processor.calls, [])
+
+    async def test_group_command_runs_with_public_context(self) -> None:
+        controller, processor = self.make_controller()
+        update, message = make_update(
+            "/agent game-user",
+            chat_type=ChatType.SUPERGROUP,
+        )
+
+        await controller.command(update, make_context())
+
+        self.assertEqual(
+            processor.calls[-1],
+            ("123", "/agent game-user", False),
+        )
+        self.assertIn("查询成功", message.sent[-1][0])
+        self.assertTrue(message.sent[-1][1]["do_quote"])
+
+    async def test_group_role_buttons_preserve_action_and_public_context(self) -> None:
+        controller, processor = self.make_controller()
+        context = make_context()
+        chat_id = -1009876543210
+
+        menu_update, _ = make_update(
+            BTN_ROLE,
+            chat_type=ChatType.SUPERGROUP,
+            chat_id=chat_id,
+        )
+        await controller.text(menu_update, context)
+        action_update, _ = make_update(
+            BTN_BAN,
+            chat_type=ChatType.SUPERGROUP,
+            chat_id=chat_id,
+        )
+        await controller.text(action_update, context)
+        server_update, _ = make_update(
+            "29 二十九区",
+            chat_type=ChatType.SUPERGROUP,
+            chat_id=chat_id,
+        )
+        await controller.text(server_update, context)
+        nickname_update, _ = make_update(
+            "完整昵称",
+            chat_type=ChatType.SUPERGROUP,
+            chat_id=chat_id,
+        )
+        await controller.text(nickname_update, context)
+
+        self.assertEqual(
+            processor.calls[-1],
+            ("123", "/role ban 29 '完整昵称'", False),
+        )
+        self.assertEqual(context.user_data[STATE_KEY], STATE_CONFIRM)
+
+    async def test_group_password_button_requires_private_chat(self) -> None:
+        controller, processor = self.make_controller()
+        update, message = make_update(BTN_PASSWORD, chat_type=ChatType.GROUP)
+
+        await controller.text(update, make_context())
+
+        self.assertEqual(processor.calls, [])
+        self.assertIn("明文密码", message.sent[-1][0])
+        self.assertIn("私聊", message.sent[-1][0])
+
+    async def test_unrelated_group_text_is_silently_ignored(self) -> None:
+        controller, processor = self.make_controller()
+        authorized, authorized_message = make_update(
+            "大家晚上好",
+            chat_type=ChatType.GROUP,
+        )
+        unauthorized, unauthorized_message = make_update(
+            "普通群消息",
+            user_id=456,
+            chat_type=ChatType.GROUP,
+        )
+
+        await controller.text(authorized, make_context())
+        await controller.text(unauthorized, make_context())
+
+        self.assertEqual(authorized_message.sent, [])
+        self.assertEqual(unauthorized_message.sent, [])
+        self.assertEqual(processor.calls, [])
+
+    async def test_private_workflow_does_not_consume_group_messages(self) -> None:
+        controller, processor = self.make_controller()
+        context = make_context()
+        private_update, _ = make_update(BTN_AGENT)
+        await controller.text(private_update, context)
+        group_update, group_message = make_update(
+            "not-an-account",
+            chat_type=ChatType.GROUP,
+        )
+
+        await controller.text(group_update, context)
+
+        self.assertEqual(group_message.sent, [])
+        self.assertEqual(processor.calls, [])
+        self.assertEqual(context.user_data[STATE_KEY], STATE_AGENT_ACCOUNT)
 
     async def test_password_query_is_protected(self) -> None:
         controller, processor = self.make_controller()

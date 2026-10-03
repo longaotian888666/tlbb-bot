@@ -293,6 +293,42 @@ class BotCommandProcessorTests(unittest.TestCase):
         self.assertIn("只能在私聊", public_response)
         self.assertIn("明文密码：plain-secret", private_response)
 
+    def test_group_role_action_and_confirmation_are_allowed(self) -> None:
+        processor, _, admin = self.make_processor()
+
+        staged = processor.handle(
+            "operator",
+            "/role unmute 29 完整昵称",
+            is_private=False,
+        )
+        confirmed = processor.handle(
+            "operator",
+            "/confirm ABC123",
+            is_private=False,
+        )
+
+        self.assertIn("解除禁言", staged)
+        self.assertIn("解除禁言成功", confirmed)
+        self.assertEqual([call[0] for call in admin.action_calls], ["unmute"])
+
+    def test_password_update_confirmation_stays_private(self) -> None:
+        processor, _, admin = self.make_processor()
+        processor.handle("operator", "/set_password game-user new-secret-value")
+
+        group_confirm = processor.handle(
+            "operator",
+            "/confirm ABC123",
+            is_private=False,
+        )
+        private_confirm = processor.handle("operator", "/confirm ABC123")
+
+        self.assertIn("只能在私聊", group_confirm)
+        self.assertIn("密码更新成功", private_confirm)
+        self.assertEqual(
+            admin.password_updates,
+            [(10001, "new-secret-value", "game-user", True)],
+        )
+
     def test_password_update_hides_secret_and_requires_confirmation(self) -> None:
         processor, _, admin = self.make_processor()
 

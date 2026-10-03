@@ -70,13 +70,9 @@ COMMAND_ALIASES = {
     "取消": "cancel",
 }
 
-PRIVATE_COMMANDS = {
-    "agent",
-    "roles",
-    "role",
+PRIVATE_ONLY_COMMANDS = {
     "password",
     "set_password",
-    "confirm",
 }
 
 TEAM_369_AGENT_IDS = frozenset(
@@ -381,8 +377,12 @@ class BotCommandProcessor:
         command = COMMAND_ALIASES.get(command_name)
         if command is None:
             return "未知命令。发送 /help 查看命令列表。"
-        if command in PRIVATE_COMMANDS and not is_private:
+        if command in PRIVATE_ONLY_COMMANDS and not is_private:
             return "此命令只能在私聊中使用。"
+        if command == "confirm" and not is_private:
+            challenge = self.get_pending_challenge(actor_id)
+            if challenge is not None and challenge.kind == "password_update":
+                return "密码更新确认只能在私聊中进行。"
 
         try:
             if command == "help":

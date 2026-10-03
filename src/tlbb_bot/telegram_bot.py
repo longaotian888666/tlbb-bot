@@ -13,6 +13,7 @@ from pathlib import Path
 
 from telegram import (
     BotCommand,
+    BotCommandScopeAllGroupChats,
     BotCommandScopeAllPrivateChats,
     BotCommandScopeChat,
     Message,
@@ -87,6 +88,7 @@ PASSWORD_ACCOUNT_KEY = "password_account"
 ADMIN_ACTION_KEY = "admin_action"
 ADMIN_TARGET_KEY = "admin_target"
 ADMIN_PENDING_AT_KEY = "admin_pending_at"
+WORKFLOW_CHAT_ID_KEY = "workflow_chat_id"
 
 STATE_MAIN = "main"
 STATE_PASSWORD_MENU = "password_menu"
@@ -112,6 +114,31 @@ ROLE_BUTTON_ACTIONS = {
     BTN_MUTE: "mute",
     BTN_UNMUTE: "unmute",
 }
+
+GROUP_CHAT_TYPES = frozenset({ChatType.GROUP, ChatType.SUPERGROUP})
+ROOT_MENU_BUTTONS = frozenset({BTN_AGENT, BTN_PASSWORD, BTN_ROLE, BTN_ADMIN})
+CONTROL_BUTTONS = frozenset(
+    {
+        *ROOT_MENU_BUTTONS,
+        BTN_QUERY_PASSWORD,
+        BTN_UPDATE_PASSWORD,
+        BTN_QUERY_ROLE,
+        BTN_SERVERS,
+        BTN_BAN,
+        BTN_UNBAN,
+        BTN_MUTE,
+        BTN_UNMUTE,
+        BTN_CONFIRM,
+        BTN_CANCEL,
+        BTN_BACK,
+        BTN_ADMIN_LIST,
+        BTN_ADMIN_ADD,
+        BTN_ADMIN_REMOVE,
+        BTN_ADMIN_CONFIRM_ADD,
+        BTN_ADMIN_CONFIRM_REMOVE,
+        BTN_ADMIN_CANCEL,
+    }
+)
 
 @dataclass(frozen=True)
 class TelegramBotSettings:
@@ -198,17 +225,19 @@ class TelegramBotSettings:
 def main_menu_keyboard(
     *,
     include_admin_management: bool = False,
+    include_password: bool = True,
 ) -> ReplyKeyboardMarkup:
-    rows = [
-        [BTN_AGENT, BTN_PASSWORD],
-        [BTN_ROLE],
-    ]
+    first_row = [BTN_AGENT]
+    if include_password:
+        first_row.append(BTN_PASSWORD)
+    rows = [first_row, [BTN_ROLE]]
     if include_admin_management:
         rows.append([BTN_ADMIN])
     return ReplyKeyboardMarkup(
         rows,
         resize_keyboard=True,
         is_persistent=True,
+        selective=True,
         input_field_placeholder="请选择功能",
     )
 
@@ -221,6 +250,7 @@ def password_menu_keyboard() -> ReplyKeyboardMarkup:
         ],
         resize_keyboard=True,
         is_persistent=True,
+        selective=True,
         input_field_placeholder="请选择查密或改密",
     )
 
@@ -235,6 +265,7 @@ def role_menu_keyboard() -> ReplyKeyboardMarkup:
         ],
         resize_keyboard=True,
         is_persistent=True,
+        selective=True,
         input_field_placeholder="请选择角色操作",
     )
 
@@ -244,6 +275,7 @@ def input_keyboard() -> ReplyKeyboardMarkup:
         [[BTN_BACK]],
         resize_keyboard=True,
         is_persistent=True,
+        selective=True,
         input_field_placeholder="请输入内容",
     )
 
@@ -256,6 +288,7 @@ def confirmation_keyboard() -> ReplyKeyboardMarkup:
         ],
         resize_keyboard=True,
         is_persistent=True,
+        selective=True,
         input_field_placeholder="请确认或取消",
     )
 
@@ -269,6 +302,7 @@ def admin_menu_keyboard() -> ReplyKeyboardMarkup:
         ],
         resize_keyboard=True,
         is_persistent=True,
+        selective=True,
         input_field_placeholder="请选择管理员操作",
     )
 
@@ -284,6 +318,7 @@ def admin_confirmation_keyboard(action: str) -> ReplyKeyboardMarkup:
         ],
         resize_keyboard=True,
         is_persistent=True,
+        selective=True,
         input_field_placeholder="请确认管理员变更",
     )
 
@@ -299,6 +334,7 @@ def server_keyboard(servers: list[dict[str, object]]) -> ReplyKeyboardMarkup:
         rows,
         resize_keyboard=True,
         is_persistent=True,
+        selective=True,
         input_field_placeholder="请选择区服",
     )
 
@@ -365,7 +401,7 @@ class TelegramBotController:
         await self._reply(
             update,
             "请选择功能。",
-            reply_markup=self._main_menu_keyboard(user.id),
+            reply_markup=self._main_menu_keyboard(user.id, update),
         )
 
     async def whoami(
@@ -395,10 +431,13 @@ class TelegramBotController:
             return
         await self._cancel_pending(user.id)
         self._reset_state(context)
+        help_text = self.processor.help_text()
+        if not self._is_private_chat(update):
+            help_text += "\n\n群聊支持代理、区服、昵称和角色操作；查改密码及管理员管理请私聊。"
         await self._reply(
             update,
-            self.processor.help_text(),
-            reply_markup=self._main_menu_keyboard(user.id),
+            help_text,
+            reply_markup=self._main_menu_keyboard(user.id, update),
         )
 
     async def admin_command(
@@ -431,7 +470,7 @@ class TelegramBotController:
                     reply_markup=admin_menu_keyboard(),
                 )
                 return
-            self._set_state(context, STATE_ADMIN_MENU)
+            self._set_state(update, context, STATE_ADMIN_MENU)
             await self._show_admin_list(update)
             return
         if len(parts) != 2:
@@ -455,7 +494,7 @@ class TelegramBotController:
                 user.id,
                 type(exc).__name__,
             )
-            self._set_state(context, STATE_ADMIN_MENU)
+            self._set_state(update, context, STATE_ADMIN_MENU)
             await self._reply(
                 update,
                 f"管理员操作失败：{exc}",
@@ -486,9 +525,13 @@ class TelegramBotController:
 
         if command_name not in {"confirm", "cancel"}:
             await self._cancel_pending(user.id)
-        response = await self._run_processor(user.id, raw_command)
-        protect_content = command_name == "password"
-        reply_markup = await self._reply_markup_for_pending(context, user.id)
+        response = await self._run_processor(
+            user.id,
+            raw_command,
+            is_private=self._is_private_chat(update),
+        )
+        protect_content = command_name == "password" and self._is_private_chat(update)
+        reply_markup = await self._reply_markup_for_pending(update, context, user.id)
         sent = await self._reply(
             update,
             response,
@@ -503,23 +546,40 @@ class TelegramBotController:
         update: Update,
         context: ContextTypes.DEFAULT_TYPE,
     ) -> None:
-        if not await self._guard(update):
-            return
         message = update.effective_message
         user = update.effective_user
-        if message is None or user is None or message.text is None:
+        chat = update.effective_chat
+        if message is None or user is None or chat is None or message.text is None:
             return
 
         user_data = require_user_data(context)
         raw_text = message.text
         text = raw_text.strip()
+        if chat.type in GROUP_CHAT_TYPES:
+            active_here = (
+                str(user_data.get(STATE_KEY) or STATE_MAIN) != STATE_MAIN
+                and user_data.get(WORKFLOW_CHAT_ID_KEY) == chat.id
+            )
+            known_control = text in CONTROL_BUTTONS
+            if not self.admin_registry.is_authorized(user.id):
+                if known_control:
+                    await self._guard(update)
+                return
+            if not active_here and not known_control:
+                return
+            if not active_here and text not in ROOT_MENU_BUTTONS:
+                await self._reply(update, "请先发送 /start 或 /menu 开始操作。")
+                return
+        if not await self._guard(update):
+            return
+
         if text == BTN_BACK:
             await self._cancel_pending(user.id)
             self._reset_state(context)
             await self._reply(
                 update,
                 "已返回主菜单。",
-                reply_markup=self._main_menu_keyboard(user.id),
+                reply_markup=self._main_menu_keyboard(user.id, update),
             )
             return
         if text == BTN_ADMIN_CANCEL:
@@ -528,10 +588,10 @@ class TelegramBotController:
                 await self._reply(
                     update,
                     "只有总管理员可以管理其他管理员。",
-                    reply_markup=self._main_menu_keyboard(user.id),
+                    reply_markup=self._main_menu_keyboard(user.id, update),
                 )
                 return
-            self._set_state(context, STATE_ADMIN_MENU)
+            self._set_state(update, context, STATE_ADMIN_MENU)
             await self._reply(
                 update,
                 "已取消管理员变更。",
@@ -539,12 +599,16 @@ class TelegramBotController:
             )
             return
         if text == BTN_CANCEL:
-            response = await self._run_processor(user.id, "/cancel")
+            response = await self._run_processor(
+                user.id,
+                "/cancel",
+                is_private=self._is_private_chat(update),
+            )
             self._reset_state(context)
             await self._reply(
                 update,
                 response,
-                reply_markup=self._main_menu_keyboard(user.id),
+                reply_markup=self._main_menu_keyboard(user.id, update),
             )
             return
         if text in {BTN_ADMIN_CONFIRM_ADD, BTN_ADMIN_CONFIRM_REMOVE}:
@@ -556,7 +620,7 @@ class TelegramBotController:
 
         if text == BTN_AGENT:
             await self._cancel_pending(user.id)
-            user_data[STATE_KEY] = STATE_AGENT_ACCOUNT
+            self._set_state(update, context, STATE_AGENT_ACCOUNT)
             await self._reply(
                 update,
                 "请输入玩家账号；跨游戏重复时可在账号后加 game_id。",
@@ -564,8 +628,16 @@ class TelegramBotController:
             )
             return
         if text == BTN_PASSWORD:
+            if not self._is_private_chat(update):
+                self._reset_state(context)
+                await self._reply(
+                    update,
+                    "查密和改密涉及明文密码，请私聊机器人操作。",
+                    reply_markup=self._main_menu_keyboard(user.id, update),
+                )
+                return
             await self._cancel_pending(user.id)
-            user_data[STATE_KEY] = STATE_PASSWORD_MENU
+            self._set_state(update, context, STATE_PASSWORD_MENU)
             await self._reply(
                 update,
                 "请选择查询密码或修改密码。",
@@ -574,7 +646,7 @@ class TelegramBotController:
             return
         if text == BTN_ROLE:
             await self._cancel_pending(user.id)
-            user_data[STATE_KEY] = STATE_ROLE_MENU
+            self._set_state(update, context, STATE_ROLE_MENU)
             await self._reply(
                 update,
                 "请选择昵称查询或角色操作。",
@@ -582,15 +654,23 @@ class TelegramBotController:
             )
             return
         if text == BTN_ADMIN:
+            if not self._is_private_chat(update):
+                self._reset_state(context)
+                await self._reply(
+                    update,
+                    "管理员管理涉及权限变更，请私聊机器人操作。",
+                    reply_markup=self._main_menu_keyboard(user.id, update),
+                )
+                return
             if not self.admin_registry.is_super_admin(user.id):
                 await self._reply(
                     update,
                     "只有总管理员可以管理其他管理员。",
-                    reply_markup=self._main_menu_keyboard(user.id),
+                    reply_markup=self._main_menu_keyboard(user.id, update),
                 )
                 return
             await self._cancel_pending(user.id)
-            self._set_state(context, STATE_ADMIN_MENU)
+            self._set_state(update, context, STATE_ADMIN_MENU)
             await self._reply(
                 update,
                 "请选择管理员操作。",
@@ -640,7 +720,7 @@ class TelegramBotController:
                 await self._reply(
                     update,
                     "请使用下方按钮选择功能。",
-                    reply_markup=self._main_menu_keyboard(user.id),
+                    reply_markup=self._main_menu_keyboard(user.id, update),
                 )
         except Exception as exc:  # noqa: BLE001 - convert workflow errors to user-safe text.
             logger.warning(
@@ -653,7 +733,7 @@ class TelegramBotController:
             await self._reply(
                 update,
                 f"操作失败：{exc}",
-                reply_markup=self._main_menu_keyboard(user.id),
+                reply_markup=self._main_menu_keyboard(user.id, update),
             )
 
     async def _handle_agent_input(
@@ -663,12 +743,16 @@ class TelegramBotController:
         user_id: int,
         text: str,
     ) -> None:
-        response = await self._run_processor(user_id, f"/agent {text}")
+        response = await self._run_processor(
+            user_id,
+            f"/agent {text}",
+            is_private=self._is_private_chat(update),
+        )
         self._reset_state(context)
         await self._reply(
             update,
             response,
-            reply_markup=self._main_menu_keyboard(user_id),
+            reply_markup=self._main_menu_keyboard(user_id, update),
         )
 
     async def _handle_password_menu(
@@ -679,7 +763,7 @@ class TelegramBotController:
     ) -> None:
         user_data = require_user_data(context)
         if text == BTN_QUERY_PASSWORD:
-            user_data[STATE_KEY] = STATE_PASSWORD_QUERY_ACCOUNT
+            self._activate_state(update, context, STATE_PASSWORD_QUERY_ACCOUNT)
             await self._reply(
                 update,
                 "请输入需要查询密码的玩家账号。",
@@ -687,7 +771,7 @@ class TelegramBotController:
             )
             return
         if text == BTN_UPDATE_PASSWORD:
-            user_data[STATE_KEY] = STATE_PASSWORD_UPDATE_ACCOUNT
+            self._activate_state(update, context, STATE_PASSWORD_UPDATE_ACCOUNT)
             await self._reply(
                 update,
                 "请输入需要修改密码的玩家账号。",
@@ -710,12 +794,13 @@ class TelegramBotController:
         response = await self._run_processor(
             user_id,
             f"/password {shlex.quote(account)}",
+            is_private=self._is_private_chat(update),
         )
         self._reset_state(context)
         sent = await self._reply(
             update,
             response,
-            reply_markup=self._main_menu_keyboard(user_id),
+            reply_markup=self._main_menu_keyboard(user_id, update),
             protect_content=True,
         )
         if sent is not None:
@@ -734,7 +819,7 @@ class TelegramBotController:
         )
         canonical_account = str(user.get("account") or "")
         user_data[PASSWORD_ACCOUNT_KEY] = canonical_account
-        user_data[STATE_KEY] = STATE_PASSWORD_NEW_VALUE
+        self._activate_state(update, context, STATE_PASSWORD_NEW_VALUE)
         await self._reply(
             update,
             f"账号已确认：{canonical_account}\n请输入新密码；该消息收到后会立即删除。",
@@ -759,15 +844,16 @@ class TelegramBotController:
         response = await self._run_processor(
             user_id,
             f"/set_password {shlex.quote(account)} {shlex.quote(new_password)}",
+            is_private=self._is_private_chat(update),
         )
         challenge = await self._pending_challenge(user_id)
         if challenge is not None:
             user_data[CONFIRMATION_TOKEN_KEY] = challenge.token
-            user_data[STATE_KEY] = STATE_CONFIRM
+            self._activate_state(update, context, STATE_CONFIRM)
             reply_markup = confirmation_keyboard()
         else:
             self._reset_state(context)
-            reply_markup = self._main_menu_keyboard(user_id)
+            reply_markup = self._main_menu_keyboard(user_id, update)
         await self._reply(
             update,
             response,
@@ -786,6 +872,7 @@ class TelegramBotController:
             response = await self._run_processor(
                 user_id,
                 "/servers",
+                is_private=self._is_private_chat(update),
             )
             await self._reply(
                 update,
@@ -802,7 +889,7 @@ class TelegramBotController:
             )
             return
         user_data[ROLE_ACTION_KEY] = action
-        user_data[STATE_KEY] = STATE_ROLE_SERVER
+        self._activate_state(update, context, STATE_ROLE_SERVER)
         servers = await asyncio.to_thread(self.processor.service.list_servers)
         await self._reply(
             update,
@@ -835,7 +922,7 @@ class TelegramBotController:
             )
             return
         user_data[SERVER_ID_KEY] = server_id
-        user_data[STATE_KEY] = STATE_ROLE_NICKNAME
+        self._activate_state(update, context, STATE_ROLE_NICKNAME)
         action = str(user_data.get(ROLE_ACTION_KEY) or "query")
         prompt = "请输入昵称片段。" if action == "query" else "请输入完整玩家昵称。"
         await self._reply(
@@ -861,14 +948,18 @@ class TelegramBotController:
             command = f"/roles {server_id} {shlex.quote(nickname)}"
         else:
             command = f"/role {action} {server_id} {shlex.quote(nickname)}"
-        response = await self._run_processor(user_id, command)
+        response = await self._run_processor(
+            user_id,
+            command,
+            is_private=self._is_private_chat(update),
+        )
         challenge = await self._pending_challenge(user_id)
         if challenge is not None:
             user_data[CONFIRMATION_TOKEN_KEY] = challenge.token
-            user_data[STATE_KEY] = STATE_CONFIRM
+            self._activate_state(update, context, STATE_CONFIRM)
             reply_markup = confirmation_keyboard()
         else:
-            user_data[STATE_KEY] = STATE_ROLE_MENU
+            self._activate_state(update, context, STATE_ROLE_MENU)
             reply_markup = role_menu_keyboard()
         await self._reply(
             update,
@@ -889,7 +980,7 @@ class TelegramBotController:
                 update,
                 "只有总管理员可以管理其他管理员。",
                 reply_markup=(
-                    self._main_menu_keyboard(user.id)
+                    self._main_menu_keyboard(user.id, update)
                     if user is not None
                     else None
                 ),
@@ -899,7 +990,7 @@ class TelegramBotController:
             await self._show_admin_list(update)
             return
         if text == BTN_ADMIN_ADD:
-            self._set_state(context, STATE_ADMIN_ADD_ID)
+            self._set_state(update, context, STATE_ADMIN_ADD_ID)
             await self._reply(
                 update,
                 "请输入要新增的管理员 Telegram 数字用户 ID。\n"
@@ -908,7 +999,7 @@ class TelegramBotController:
             )
             return
         if text == BTN_ADMIN_REMOVE:
-            self._set_state(context, STATE_ADMIN_REMOVE_ID)
+            self._set_state(update, context, STATE_ADMIN_REMOVE_ID)
             await self._reply(
                 update,
                 "请输入要删除的管理员 Telegram 数字用户 ID。",
@@ -968,7 +1059,7 @@ class TelegramBotController:
 
         self._reset_state(context)
         user_data = require_user_data(context)
-        user_data[STATE_KEY] = STATE_ADMIN_CONFIRM
+        self._activate_state(update, context, STATE_ADMIN_CONFIRM)
         user_data[ADMIN_ACTION_KEY] = action
         user_data[ADMIN_TARGET_KEY] = target_id
         user_data[ADMIN_PENDING_AT_KEY] = time.monotonic()
@@ -1002,7 +1093,7 @@ class TelegramBotController:
             or not isinstance(target_id, int)
             or not isinstance(pending_at, (int, float))
         ):
-            self._set_state(context, STATE_ADMIN_MENU)
+            self._set_state(update, context, STATE_ADMIN_MENU)
             await self._reply(
                 update,
                 "当前没有待确认的管理员变更。",
@@ -1010,7 +1101,7 @@ class TelegramBotController:
             )
             return
         if time.monotonic() - pending_at > ADMIN_CONFIRMATION_TTL_SECONDS:
-            self._set_state(context, STATE_ADMIN_MENU)
+            self._set_state(update, context, STATE_ADMIN_MENU)
             await self._reply(
                 update,
                 "管理员变更确认已过期，请重新发起。",
@@ -1043,7 +1134,7 @@ class TelegramBotController:
                 user_id,
                 type(exc).__name__,
             )
-            self._set_state(context, STATE_ADMIN_MENU)
+            self._set_state(update, context, STATE_ADMIN_MENU)
             await self._reply(
                 update,
                 f"管理员操作失败：{exc}",
@@ -1055,7 +1146,7 @@ class TelegramBotController:
         await self._reply(
             update,
             response,
-            reply_markup=self._main_menu_keyboard(user_id),
+            reply_markup=self._main_menu_keyboard(user_id, update),
         )
 
     @staticmethod
@@ -1080,23 +1171,33 @@ class TelegramBotController:
             await self._reply(
                 update,
                 "当前没有待确认操作。",
-                reply_markup=self._main_menu_keyboard(user_id),
+                reply_markup=self._main_menu_keyboard(user_id, update),
             )
             return
-        response = await self._run_processor(user_id, f"/confirm {token}")
+        response = await self._run_processor(
+            user_id,
+            f"/confirm {token}",
+            is_private=self._is_private_chat(update),
+        )
         self._reset_state(context)
         await self._reply(
             update,
             response,
-            reply_markup=self._main_menu_keyboard(user_id),
+            reply_markup=self._main_menu_keyboard(user_id, update),
         )
 
-    async def _run_processor(self, user_id: int, command: str) -> str:
+    async def _run_processor(
+        self,
+        user_id: int,
+        command: str,
+        *,
+        is_private: bool = True,
+    ) -> str:
         return await asyncio.to_thread(
             self.processor.handle,
             str(user_id),
             command,
-            is_private=True,
+            is_private=is_private,
         )
 
     async def _pending_challenge(
@@ -1113,18 +1214,31 @@ class TelegramBotController:
         if challenge is not None:
             await self._run_processor(user_id, "/cancel")
 
-    def _main_menu_keyboard(self, user_id: int) -> ReplyKeyboardMarkup:
+    def _main_menu_keyboard(
+        self,
+        user_id: int,
+        update: Update | None = None,
+    ) -> ReplyKeyboardMarkup:
+        is_private = update is None or self._is_private_chat(update)
         return main_menu_keyboard(
-            include_admin_management=self.admin_registry.is_super_admin(user_id)
+            include_admin_management=(
+                is_private and self.admin_registry.is_super_admin(user_id)
+            ),
+            include_password=is_private,
         )
+
+    @staticmethod
+    def _is_private_chat(update: Update) -> bool:
+        chat = update.effective_chat
+        return chat is not None and chat.type == ChatType.PRIVATE
 
     async def _guard(self, update: Update) -> bool:
         chat = update.effective_chat
         user = update.effective_user
         if chat is None or user is None:
             return False
-        if chat.type != ChatType.PRIVATE:
-            await self._reply(update, "请私聊机器人使用后台功能。")
+        if chat.type not in {ChatType.PRIVATE, *GROUP_CHAT_TYPES}:
+            await self._reply(update, "该聊天类型不支持后台功能。")
             return False
         if not self.admin_registry.is_authorized(user.id):
             await self._reply(
@@ -1139,6 +1253,9 @@ class TelegramBotController:
 
     async def _guard_super_admin(self, update: Update) -> bool:
         if not await self._guard(update):
+            return False
+        if not self._is_private_chat(update):
+            await self._reply(update, "管理员管理涉及权限变更，请私聊机器人操作。")
             return False
         user = update.effective_user
         if user is None or not self.admin_registry.is_super_admin(user.id):
@@ -1162,17 +1279,19 @@ class TelegramBotController:
             for index in range(0, max(1, len(text)), TELEGRAM_MESSAGE_CHUNK_SIZE)
         ]
         sent: Message | None = None
+        do_quote = not self._is_private_chat(update)
         for index, chunk in enumerate(chunks):
             sent = await message.reply_text(
                 chunk,
                 reply_markup=reply_markup if index == len(chunks) - 1 else None,
                 protect_content=protect_content,
-                do_quote=False,
+                do_quote=do_quote,
             )
         return sent
 
     async def _reply_markup_for_pending(
         self,
+        update: Update,
         context: ContextTypes.DEFAULT_TYPE,
         user_id: int,
     ) -> ReplyKeyboardMarkup:
@@ -1180,10 +1299,10 @@ class TelegramBotController:
         challenge = await self._pending_challenge(user_id)
         if challenge is not None:
             user_data[CONFIRMATION_TOKEN_KEY] = challenge.token
-            user_data[STATE_KEY] = STATE_CONFIRM
+            self._activate_state(update, context, STATE_CONFIRM)
             return confirmation_keyboard()
         self._reset_state(context)
-        return self._main_menu_keyboard(user_id)
+        return self._main_menu_keyboard(user_id, update)
 
     def _schedule_secret_deletion(
         self,
@@ -1230,6 +1349,7 @@ class TelegramBotController:
             ADMIN_ACTION_KEY,
             ADMIN_TARGET_KEY,
             ADMIN_PENDING_AT_KEY,
+            WORKFLOW_CHAT_ID_KEY,
         ):
             user_data.pop(key, None)
         user_data[STATE_KEY] = STATE_MAIN
@@ -1237,11 +1357,25 @@ class TelegramBotController:
     @classmethod
     def _set_state(
         cls,
+        update: Update,
         context: ContextTypes.DEFAULT_TYPE,
         state: str,
     ) -> None:
         cls._reset_state(context)
-        require_user_data(context)[STATE_KEY] = state
+        cls._activate_state(update, context, state)
+
+    @staticmethod
+    def _activate_state(
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        state: str,
+    ) -> None:
+        chat = update.effective_chat
+        if chat is None:
+            raise RuntimeError("Telegram update does not provide a chat")
+        user_data = require_user_data(context)
+        user_data[STATE_KEY] = state
+        user_data[WORKFLOW_CHAT_ID_KEY] = chat.id
 
     @staticmethod
     def _clear_user_workflow(
@@ -1319,9 +1453,25 @@ def build_application(
             BotCommand("cancel", "取消待确认操作"),
             BotCommand("help", "查看命令帮助"),
         ]
+        group_commands = [
+            BotCommand("start", "显示群聊操作菜单"),
+            BotCommand("menu", "显示群聊操作菜单"),
+            BotCommand("whoami", "查看 Telegram 用户 ID"),
+            BotCommand("agent", "查询账号代理"),
+            BotCommand("servers", "查看后台区服"),
+            BotCommand("roles", "按昵称查询角色"),
+            BotCommand("role", "发起角色操作"),
+            BotCommand("confirm", "确认待处理操作"),
+            BotCommand("cancel", "取消待确认操作"),
+            BotCommand("help", "查看命令帮助"),
+        ]
         await app.bot.set_my_commands(
             private_commands,
             scope=BotCommandScopeAllPrivateChats(),
+        )
+        await app.bot.set_my_commands(
+            group_commands,
+            scope=BotCommandScopeAllGroupChats(),
         )
         if settings.super_admin_id is not None:
             await app.bot.set_my_commands(
@@ -1370,7 +1520,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--check",
         action="store_true",
-        help="Validate Telegram connectivity, install private-chat commands, and exit.",
+        help="Validate Telegram connectivity, install private/group commands, and exit.",
     )
     parser.add_argument(
         "--keep-pending-updates",
